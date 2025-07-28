@@ -13,7 +13,7 @@ export type EventType = string | symbol;
 export type Handler<T = unknown> = (event: T) => void;
 export type WildcardHandler<T = Record<string, unknown>> = (
 	type: keyof T,
-	event: T[keyof T]
+	event: T[keyof T],
 ) => void;
 
 export type EventHandlerList<T = unknown> = Array<Handler<T>>;
@@ -22,7 +22,7 @@ export type WildCardEventHandlerList<T = Record<string, unknown>> = Array<
 >;
 
 export type EventHandlerMap<Events extends Record<EventType, unknown>> = Map<
-	keyof Events | '*',
+	keyof Events | "*",
 	EventHandlerList<Events[keyof Events]> | WildCardEventHandlerList<Events>
 >;
 
@@ -37,10 +37,10 @@ export class Mitt<Events extends Record<EventType, unknown> = any> {
 	 * Register an event handler for the given type.
 	 */
 	on<Key extends keyof Events>(type: Key, handler: Handler<Events[Key]>): void;
-	on(type: '*', handler: WildcardHandler<Events>): void;
+	on(type: "*", handler: WildcardHandler<Events>): void;
 	on<Key extends keyof Events>(
-		type: Key | '*',
-		handler: Handler<Events[Key]> | WildcardHandler<Events>
+		type: Key | "*",
+		handler: Handler<Events[Key]> | WildcardHandler<Events>,
 	): void {
 		const handlers = this.all.get(type);
 		if (handlers) {
@@ -53,11 +53,14 @@ export class Mitt<Events extends Record<EventType, unknown> = any> {
 	/**
 	 * Remove an event handler for the given type.
 	 */
-	off<Key extends keyof Events>(type: Key, handler?: Handler<Events[Key]>): void;
-	off(type: '*', handler: WildcardHandler<Events>): void;
 	off<Key extends keyof Events>(
-		type: Key | '*',
-		handler?: Handler<Events[Key]> | WildcardHandler<Events>
+		type: Key,
+		handler?: Handler<Events[Key]>,
+	): void;
+	off(type: "*", handler: WildcardHandler<Events>): void;
+	off<Key extends keyof Events>(
+		type: Key | "*",
+		handler?: Handler<Events[Key]> | WildcardHandler<Events>,
 	): void {
 		const handlers = this.all.get(type);
 		if (!handlers) return;
@@ -75,17 +78,22 @@ export class Mitt<Events extends Record<EventType, unknown> = any> {
 	/**
 	 * Invoke all handlers for the given type.
 	 */
-	protected emit<Key extends keyof Events>(type: Key, event: Events[Key]): void {
+	protected emit<Key extends keyof Events>(
+		type: Key,
+		event: Events[Key],
+	): void {
 		const handlers = this.all.get(type);
 		if (handlers) {
-			(handlers as EventHandlerList<Events[Key]>).slice().forEach(h => h(event));
+			(handlers as EventHandlerList<Events[Key]>)
+				.slice()
+				.forEach((h) => h(event));
 		}
 
-		const wildcards = this.all.get('*');
+		const wildcards = this.all.get("*");
 		if (wildcards) {
 			(wildcards as WildCardEventHandlerList<Events>)
 				.slice()
-				.forEach(h => h(type, event));
+				.forEach((h) => h(type, event));
 		}
 	}
 }
