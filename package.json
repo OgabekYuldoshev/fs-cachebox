@@ -1,11 +1,12 @@
 {
   "name": "fs-cachebox",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A lightweight file-based caching library for Node.js. Stores key-value data on the filesystem with optional TTL support.",
   "type": "module",
   "scripts": {
     "test": "vitest run --coverage",
     "build": "./scripts/build.sh",
+    "release": "changelogen --release",
     "lint": "biome check --write src"
   },
   "exports": {
@@ -54,6 +55,7 @@
     "@biomejs/biome": "2.1.2",
     "@types/node": "^24.1.0",
     "@vitest/coverage-v8": "3.2.4",
+    "changelogen": "^0.6.2",
     "typescript": "^5.8.3",
     "unbuild": "^3.6.0",
     "vitest": "^3.2.4"
