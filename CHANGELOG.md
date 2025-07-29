@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v1.1.1
+
+[compare changes](https://github.com/OgabekYuldoshev/fs-cachebox/compare/v1.1.0...v1.1.1)
+
+### 🩹 Fixes
+
+- Update readme file ([2d09b5e](https://github.com/OgabekYuldoshev/fs-cachebox/commit/2d09b5e))
+
+### ❤️ Contributors
+
+- OgabekYuldoshev <yuldashoff1@gmail.com>
+
 ## v1.1.0
 
 
