@@ -575,7 +575,6 @@ export class CacheBox extends EventEmitter<
 
       return true;
     } catch (error) {
-      console.log("ERROOROROR", error)
       this.emitError("set", key, error as Error);
       return false;
     }
