@@ -136,20 +136,18 @@ describe("CacheBox", () => {
   });
 
   describe("Key Validation", () => {
-    const invalidKeys = [
-      "",
-      "../traversal",
-      "path/with/slash",
-      "path\\with\\backslash",
-      "CON", // Windows reserved
-      "key<>invalid",
-      "key|invalid",
-      "a".repeat(256), // Too long
-    ];
-
-    invalidKeys.forEach((key) => {
-      it(`should reject invalid key: "${key}"`, () => {
-        // The method should return false, not throw an error
+    it(`should reject invalid key`, () => {
+      const invalidKeys = [
+        "",
+        "../traversal",
+        "path/with/slash",
+        "path\\with\\backslash",
+        "CON", // Windows reserved
+        "key<>invalid",
+        "key|invalid",
+        "a".repeat(1_000_001), // Too long
+      ];
+      invalidKeys.forEach((key) => {
         const result = cache.set(key, "value");
         expect(result).toBe(false);
         expect(cache.get(key)).toBeNull();
@@ -158,12 +156,7 @@ describe("CacheBox", () => {
     });
 
     it("should accept valid keys", () => {
-      const validKeys = [
-        "test",
-        "test-key",
-        "test_key",
-        "test123",
-      ];
+      const validKeys = ["test", "test-key", "test_key", "test123"];
       validKeys.forEach((key) => {
         expect(cache.set(key, "value")).toBe(true);
         expect(cache.has(key)).toBe(true);

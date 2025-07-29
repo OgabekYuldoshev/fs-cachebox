@@ -11,8 +11,8 @@ import {
 import { readFile, writeFile, stat, rm } from "node:fs/promises";
 import { gzipSync, gunzipSync } from "node:zlib";
 import path, { join } from "node:path";
-import { parse, stringify } from "flatted";
 import { EventEmitter } from "node:events";
+import { parse, stringify } from "devalue";
 
 /**
  * Custom error class for cache operations
@@ -161,7 +161,7 @@ export class CacheBox extends EventEmitter<
    */
   private validateKey(key: string): boolean {
     if (!key || typeof key !== "string") return false;
-    if (key.length === 0 || key.length > 255) return false;
+    if (key.length === 0 || key.length > 1_000_000) return false;
 
     // Prevent directory traversal
     if (key.includes("..") || key.includes("/") || key.includes("\\"))
@@ -519,7 +519,6 @@ export class CacheBox extends EventEmitter<
 
       const content = readFileSync(filePath, "utf8");
       const result = this.deserialize<T>(content, entry.compressed);
-
       // Update access time
       entry.accessed = Date.now();
       this._stats.hits++;
@@ -709,6 +708,7 @@ export class CacheBox extends EventEmitter<
       }
 
       const content = await readFile(filePath, "utf8");
+
       const result = this.deserialize<T>(content, entry.compressed);
 
       entry.accessed = Date.now();
