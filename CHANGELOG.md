@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v1.1.2
+
+[compare changes](https://github.com/OgabekYuldoshev/fs-cachebox/compare/v1.1.1...v1.1.2)
+
+### 🩹 Fixes
+
+- Change serialize and deserialize function parsers and change some test cases ([58db077](https://github.com/OgabekYuldoshev/fs-cachebox/commit/58db077))
+
+### ❤️ Contributors
+
+- OgabekYuldoshev <yuldashoff1@gmail.com>
+
 ## v1.1.1
 
 [compare changes](https://github.com/OgabekYuldoshev/fs-cachebox/compare/v1.1.0...v1.1.1)
