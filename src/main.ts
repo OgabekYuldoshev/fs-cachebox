@@ -1,601 +1,964 @@
+/** biome-ignore-all lint/suspicious/noControlCharactersInRegex: <explanation> */
 import {
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  statSync,
 } from "node:fs";
+import { readFile, writeFile, stat, rm } from "node:fs/promises";
+import { gzipSync, gunzipSync } from "node:zlib";
 import path, { join } from "node:path";
 import { parse, stringify } from "flatted";
-import { FILENAME_TIME_EXTRACTOR } from "./constants";
-import { Mitt } from "./event-listener";
+import { EventEmitter } from "node:events";
 
 /**
- * Configuration options for CacheBox initialization
+ * Custom error class for cache operations
+ */
+export class CacheError extends Error {
+  constructor(
+    message: string,
+    public operation: string,
+    public key?: string,
+    public originalError?: Error
+  ) {
+    super(message);
+    this.name = "CacheError";
+    if (originalError?.stack) {
+      this.stack = `${this.stack}\nCaused by: ${originalError.stack}`;
+    }
+  }
+}
+
+/**
+ * Enhanced configuration options for CacheBox initialization
  */
 export interface CacheBoxOptions {
-	/** Directory path where cache files will be stored. Defaults to '.cache' */
-	cacheDir?: string;
+  /** Directory path where cache files will be stored. Defaults to '.cache' */
+  cacheDir?: string;
+  /** Enable automatic compression for cached values. Defaults to false */
+  enableCompression?: boolean;
+  /** Minimum size (in bytes) before compression kicks in. Defaults to 1024 */
+  compressionThreshold?: number;
+  /** Compression level (1-9, where 9 is best compression). Defaults to 6 */
+  compressionLevel?: number;
+  /** Maximum number of cache entries. Defaults to unlimited */
+  maxSize?: number;
+  /** Maximum size per cache file in bytes. Defaults to 50MB */
+  maxFileSize?: number;
+  /** Default TTL for entries in milliseconds. Defaults to 0 (no expiration) */
+  defaultTTL?: number;
+  /** Auto-cleanup interval in milliseconds. Defaults to 300000 (5 minutes) */
+  cleanupInterval?: number;
+  /** Enable automatic cleanup of expired entries. Defaults to true */
+  enableAutoCleanup?: boolean;
+  /** Enable detailed logging. Defaults to false */
+  enableLogging?: boolean;
+}
+
+/**
+ * Cache entry metadata
+ */
+interface CacheEntry {
+  ttl: number;
+  compressed: boolean;
+  size: number;
+  created: number;
+  accessed: number;
 }
 
 /**
  * Event types emitted by CacheBox
  */
-type Events = {
-	/** Emitted when any error occurs during cache operations */
-	error: Error;
-	/** Emitted when cache data is modified (set operation) */
-	changed: any;
+export interface CacheBoxEvents {
+  /** Emitted when cache is initialized and ready */
+  ready: { entriesLoaded: number; cacheDir: string };
+  /** Emitted when cache data is modified */
+  change: { operation: string; key: string; value?: any };
+  /** Emitted when any error occurs */
+  error: CacheError;
+  /** Emitted when cache entry expires */
+  expire: { key: string; ttl: number };
+  /** Emitted when cache is cleared */
+  clear: { entriesRemoved: number };
+  /** Emitted during cleanup operations */
+  cleanup: { expired: number; removed: number };
+}
+type EventMapToTuplePayload<T> = {
+  [K in keyof T]: [T[K]];
 };
-
 /**
- * File-based cache system with TTL (Time-To-Live) support and event emission
+ * Enhanced file-based cache system with comprehensive features
  *
  * Features:
- * - Persistent file-based storage that survives application restarts
- * - Automatic expiration with configurable TTL
- * - Event-driven architecture for monitoring cache operations
- * - TypeScript support with generics for type safety
- * - Automatic cleanup of expired entries
- * - Circular reference support via flatted serialization
- * - Memory-file synchronization for consistency
- *
- * @example
- * ```typescript
- * const cache = new CacheBox({ cacheDir: './my-cache' });
- *
- *
- * cache.on('error', (error) => {
- *   console.error('Cache error:', error.message);
- * });
- * ```
+ * - Async and sync operations
+ * - Compression support with configurable thresholds
+ * - Key validation and security
+ * - Event-driven architecture
+ * - Performance monitoring
+ * - Automatic cleanup
+ * - Batch operations
+ * - Type safety with generics
+ * - LRU eviction when size limits are reached
  */
-class CacheBox extends Mitt<Events> {
-	/** In-memory map storing cache keys and their TTL timestamps for fast lookup */
-	private _cache = new Map<string, number>();
+export class CacheBox extends EventEmitter<
+  EventMapToTuplePayload<CacheBoxEvents>
+> {
+  private _cache = new Map<string, CacheEntry>();
+  private _cacheDir = ".cache";
+  private _enableCompression = false;
+  private _compressionThreshold = 1024;
+  private _compressionLevel = 6;
+  private _maxSize?: number;
+  private _maxFileSize = 50 * 1024 * 1024; // 50MB
+  private _defaultTTL = 0;
+  private _cleanupInterval = 5 * 60 * 1000; // 5 minutes
+  private _enableAutoCleanup = true;
+  private _enableLogging = false;
+  private _cleanupTimer?: NodeJS.Timeout;
+  private _stats = {
+    hits: 0,
+    misses: 0,
+    sets: 0,
+    deletes: 0,
+    errors: 0,
+  };
 
-	/** Directory path where cache files are stored */
-	private _cacheDir = ".cache";
+  constructor(options?: CacheBoxOptions) {
+    super();
+    this.setMaxListeners(100); // Increase listener limit for high-usage scenarios
 
-	/** Reference to flatted parse function for deserialization with circular reference support */
-	private readonly _parse = parse;
+    // Apply configuration
+    if (options?.cacheDir) this._cacheDir = options.cacheDir;
+    if (options?.enableCompression !== undefined)
+      this._enableCompression = options.enableCompression;
+    if (options?.compressionThreshold)
+      this._compressionThreshold = options.compressionThreshold;
+    if (options?.compressionLevel) {
+      this._compressionLevel = Math.max(
+        1,
+        Math.min(9, options.compressionLevel)
+      );
+    }
+    if (options?.maxSize) this._maxSize = options.maxSize;
+    if (options?.maxFileSize) this._maxFileSize = options.maxFileSize;
+    if (options?.defaultTTL) this._defaultTTL = options.defaultTTL;
+    if (options?.cleanupInterval)
+      this._cleanupInterval = options.cleanupInterval;
+    if (options?.enableAutoCleanup !== undefined)
+      this._enableAutoCleanup = options.enableAutoCleanup;
+    if (options?.enableLogging !== undefined)
+      this._enableLogging = options.enableLogging;
 
-	/** Reference to flatted stringify function for serialization with circular reference support */
-	private readonly _stringify = stringify;
+    // Initialize cache
+    this.load();
+  }
 
-	/**
-	 * Creates a new CacheBox instance and initializes the cache system
-	 *
-	 * The constructor sets up the cache directory, loads existing cache files,
-	 * and synchronizes the in-memory cache with the file system. Uses flatted
-	 * for serialization to handle objects with circular references.
-	 *
-	 * @param options - Configuration options for the cache
-	 * @param options.cacheDir - Custom directory for cache files (defaults to '.cache')
-	 *
-	 * @example
-	 * ```typescript
-	 * // Use default cache directory (.cache)
-	 * const cache = new CacheBox();
-	 *
-	 * // Use custom cache directory
-	 * const cache = new CacheBox({ cacheDir: './custom-cache' });
-	 *
-	 * // Use absolute path
-	 * const cache = new CacheBox({ cacheDir: '/tmp/my-app-cache' });
-	 * ```
-	 */
-	constructor(options?: CacheBoxOptions) {
-		super();
+  /**
+   * Validates cache key for security and filesystem compatibility
+   */
+  private validateKey(key: string): boolean {
+    if (!key || typeof key !== "string") return false;
+    if (key.length === 0 || key.length > 255) return false;
 
-		if (options?.cacheDir) {
-			this._cacheDir = options.cacheDir;
-		}
+    // Prevent directory traversal
+    if (key.includes("..") || key.includes("/") || key.includes("\\"))
+      return false;
 
-		this.load();
-	}
+    // Invalid filename characters
+    const invalidChars = /[<>:"/\\|?*\x00-\x1f]/;
+    if (invalidChars.test(key)) return false;
 
-	/**
-	 * Initializes the cache system by creating directories and syncing with filesystem
-	 *
-	 * This method performs the initial setup:
-	 * 1. Creates the cache directory if it doesn't exist
-	 * 2. Calls syncMemoryCache to load existing cache files
-	 * 3. Emits 'loaded' event when ready or 'error' event on failure
-	 *
-	 * @private
-	 * @emits loaded - When cache is successfully initialized and ready to use
-	 * @emits error - When initialization fails (directory creation, file access, etc.)
-	 */
-	private load() {
-		try {
-			const cacheDir = path.resolve(this._cacheDir);
+    // Reserved Windows filenames
+    const reservedNames = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+    if (reservedNames.test(key)) return false;
 
-			if (!existsSync(cacheDir)) {
-				mkdirSync(cacheDir, {
-					recursive: true,
-				});
-			}
+    return true;
+  }
 
-			// Synchronize in-memory cache with filesystem
-			this.syncMemoryCache();
-		} catch (error) {
-			throw error as Error;
-		}
-	}
+  /**
+   * Logs messages if logging is enabled
+   */
+  private log(
+    level: "info" | "warn" | "error",
+    message: string,
+    extra?: any
+  ): void {
+    if (this._enableLogging) {
+      console[level](`[CacheBox] ${message}`, extra || "");
+    }
+  }
 
-	/**
-	 * Checks if a specific cache file has expired and removes it if necessary
-	 *
-	 * Uses the FILENAME_TIME_EXTRACTOR regex to parse the filename and extract
-	 * the TTL timestamp. If the current time exceeds the TTL, the file is deleted.
-	 * Files with TTL of 0 never expire.
-	 *
-	 * @private
-	 * @param file - Filename to check for expiration (format: "key_timestamp")
-	 * @emits error - When file deletion fails
-	 *
-	 * @example
-	 * Expected filename format: "user-session_1234567890"
-	 * where 1234567890 is the expiration timestamp in milliseconds
-	 */
-	private checkExpiredFile(file: string) {
-		try {
-			const match = file.match(FILENAME_TIME_EXTRACTOR);
-			const ttl = match ? Number(match[2]) : 0;
+  /**
+   * Serializes and optionally compresses data
+   */
+  private serialize(value: any): {
+    data: string;
+    compressed: boolean;
+    size: number;
+  } {
+    try {
+      const serialized = stringify(value);
+      const originalSize = Buffer.byteLength(serialized, "utf8");
 
-			// Remove file if TTL has expired (ttl = 0 means no expiration)
-			if (ttl !== 0 && ttl < Date.now()) {
-				rmSync(join(this._cacheDir, file));
-			}
-		} catch (error) {
-			this.emit("error", error as Error);
-		}
-	}
+      // Check file size limits
+      if (originalSize > this._maxFileSize) {
+        throw new CacheError(
+          `Value size (${originalSize} bytes) exceeds maximum file size (${this._maxFileSize} bytes)`,
+          "serialize"
+        );
+      }
 
-	/**
-	 * Synchronizes the in-memory cache with the filesystem
-	 *
-	 * This critical method ensures consistency between memory and disk:
-	 * 1. Scans all files in the cache directory
-	 * 2. Parses filenames to extract keys and TTL timestamps
-	 * 3. Removes expired files automatically
-	 * 4. Rebuilds the in-memory cache map with valid entries only
-	 *
-	 * This method is called during initialization and helps recover from
-	 * situations where the application was restarted or crashed.
-	 *
-	 * @private
-	 * @emits error - When file system operations fail
-	 *
-	 * @example
-	 * If cache directory contains:
-	 * - "user_0" (never expires)
-	 * - "session_1234567890" (expires at timestamp)
-	 * - "temp_1000000000" (already expired)
-	 *
-	 * Result: temp file deleted, user and session loaded into memory
-	 */
-	private syncMemoryCache() {
-		try {
-			const cacheDir = path.resolve(this._cacheDir);
-			if (!existsSync(cacheDir)) return;
+      // Apply compression if enabled and threshold is met
+      if (
+        this._enableCompression &&
+        originalSize > this._compressionThreshold
+      ) {
+        try {
+          const compressed = gzipSync(serialized, {
+            level: this._compressionLevel,
+          });
+          const base64 = compressed.toString("base64");
 
-			const files = readdirSync(cacheDir);
-			const newCache = new Map<string, number>();
+          // Only use compression if it actually saves space
+          if (base64.length < serialized.length) {
+            return { data: base64, compressed: true, size: base64.length };
+          }
+        } catch (compressionError) {
+          this.log(
+            "warn",
+            "Compression failed, storing uncompressed",
+            compressionError
+          );
+        }
+      }
 
-			files.forEach((file) => {
-				const match = file.match(FILENAME_TIME_EXTRACTOR);
-				if (match) {
-					const [, key, ttlStr] = match;
-					const ttl = Number(ttlStr);
+      return { data: serialized, compressed: false, size: originalSize };
+    } catch (error) {
+      throw new CacheError(
+        "Serialization failed",
+        "serialize",
+        undefined,
+        error as Error
+      );
+    }
+  }
 
-					// Only keep non-expired entries
-					if (ttl === 0 || ttl > Date.now()) {
-						newCache.set(key!, ttl);
-					} else {
-						// Remove expired file
-						rmSync(join(cacheDir, file));
-					}
-				}
-			});
+  /**
+   * Deserializes and optionally decompresses data
+   */
+  private deserialize<T>(data: string, compressed: boolean): T {
+    try {
+      if (compressed) {
+        const buffer = Buffer.from(data, "base64");
+        const decompressed = gunzipSync(buffer).toString("utf8");
+        return parse(decompressed) as T;
+      }
+      return parse(data) as T;
+    } catch (error) {
+      throw new CacheError(
+        "Deserialization failed",
+        "deserialize",
+        undefined,
+        error as Error
+      );
+    }
+  }
 
-			this._cache = newCache;
-		} catch (error) {
-			throw error as Error;
-		}
-	}
+  /**
+   * Parses filename to extract metadata
+   */
+  private parseFileName(
+    fileName: string
+  ): { key: string; ttl: number; compressed: boolean } | null {
+    const match = fileName.match(/^(.+)_(\d+)(_c)?$/);
 
-	/**
-	 * Checks if a cache key exists and has not expired
-	 *
-	 * This method performs both existence and expiration checks:
-	 * - Returns false if key doesn't exist in memory cache
-	 * - Returns false if key exists but has expired (and deletes it)
-	 * - Returns true only if key exists and is still valid
-	 *
-	 * @param key - The cache key to check
-	 * @returns true if key exists and is not expired, false otherwise
-	 *
-	 * @example
-	 * ```typescript
-	 * // Check before retrieving
-	 * if (cache.has('user-session')) {
-	 *   const session = cache.get('user-session');
-	 *   console.log('Session found:', session);
-	 * } else {
-	 *   console.log('Session not found or expired');
-	 * }
-	 *
-	 * // Use in conditional logic
-	 * const useCache = cache.has('expensive-calculation');
-	 * const result = useCache
-	 *   ? cache.get('expensive-calculation')
-	 *   : performExpensiveCalculation();
-	 * ```
-	 */
-	public has(key: string): boolean {
-		if (!this._cache.has(key)) return false;
+    if (!match) return null;
+    const key = match[1] || "";
 
-		const fileTtl = this._cache.get(key)!;
-		if (fileTtl !== 0 && fileTtl < Date.now()) {
-			this.delete(key);
-			return false;
-		}
+    return {
+      key,
+      ttl: Number(match[2]),
+      compressed: Boolean(match[3]),
+    };
+  }
 
-		return true;
-	}
+  /**
+   * Generates filename with metadata
+   */
+  private generateFileName(
+    key: string,
+    ttl: number,
+    compressed: boolean
+  ): string {
+    return `${key}_${ttl}${compressed ? "_c" : ""}`;
+  }
 
-	/**
-	 * Returns the current number of entries in the in-memory cache
-	 *
-	 * Note: This returns the raw size of the memory cache map, which may
-	 * include expired entries that haven't been cleaned up yet. For the
-	 * count of valid entries, use `keys().length` instead.
-	 *
-	 * @returns The number of entries in the cache map
-	 *
-	 * @example
-	 * ```typescript
-	 * console.log(`Total cache entries: ${cache.size()}`);
-	 * console.log(`Valid cache entries: ${cache.keys().length}`);
-	 *
-	 * // Monitor cache growth
-	 * const initialSize = cache.size();
-	 * cache.set('new-item', 'value');
-	 * console.log(`Cache grew by: ${cache.size() - initialSize}`);
-	 * ```
-	 */
-	public size(): number {
-		return this._cache.size;
-	}
+  /**
+   * Removes expired entries and enforces size limits
+   */
+  private performCleanup(): void {
+    try {
+      const now = Date.now();
+      let expired = 0;
+      let removed = 0;
 
-	/**
-	 * Returns an array of all valid (non-expired) cache keys
-	 *
-	 * This method filters the cache keys by calling `has()` on each one,
-	 * which also triggers automatic cleanup of expired entries as a side effect.
-	 * The returned array contains only keys for entries that currently exist
-	 * and have not expired.
-	 *
-	 * @returns Array of valid cache keys
-	 *
-	 * @example
-	 * ```typescript
-	 * // Get all valid keys
-	 * const allKeys = cache.keys();
-	 * console.log('Valid cache keys:', allKeys);
-	 *
-	 * // Iterate over all cached items
-	 * allKeys.forEach(key => {
-	 *   const value = cache.get(key);
-	 *   console.log(`${key}:`, value);
-	 * });
-	 *
-	 * // Find keys matching a pattern
-	 * const userKeys = cache.keys().filter(key => key.startsWith('user:'));
-	 * console.log('User-related keys:', userKeys);
-	 * ```
-	 */
-	public keys(): string[] {
-		return Array.from(this._cache.keys()).filter((key) => this.has(key));
-	}
+      // Remove expired entries
+      for (const [key, entry] of this._cache.entries()) {
+        if (entry.ttl !== 0 && entry.ttl < now) {
+          this.delete(key);
+          expired++;
+          this.emit("expire", { key, ttl: entry.ttl });
+        }
+      }
 
-	/**
-	 * Returns comprehensive statistics about the current cache state
-	 *
-	 * Provides useful information for monitoring, debugging, and cache management:
-	 * - Current number of valid entries
-	 * - Cache directory path
-	 * - List of all valid keys
-	 *
-	 * @returns Object containing cache statistics
-	 * @returns returns.size - Number of valid (non-expired) cache entries
-	 * @returns returns.cacheDir - Absolute or relative path to the cache directory
-	 * @returns returns.keys - Array of all valid cache keys
-	 *
-	 * @example
-	 * ```typescript
-	 * // Get comprehensive cache info
-	 * const stats = cache.stats();
-	 * console.log('Cache Statistics:', {
-	 *   entries: stats.size,
-	 *   location: stats.cacheDir,
-	 *   keys: stats.keys.join(', ')
-	 * });
-	 *
-	 * // Monitor cache health
-	 * if (stats.size > 1000) {
-	 *   console.warn('Cache is getting large, consider cleanup');
-	 * }
-	 *
-	 * // Debug cache contents
-	 * stats.keys.forEach(key => {
-	 *   console.log(`${key}: ${cache.get(key)}`);
-	 * });
-	 * ```
-	 */
-	public stats() {
-		return {
-			size: this.size(),
-			cacheDir: this._cacheDir,
-			keys: this.keys(),
-		};
-	}
+      // Enforce size limits with LRU eviction
+      if (this._maxSize && this._cache.size > this._maxSize) {
+        const sortedEntries = Array.from(this._cache.entries()).sort(
+          ([, a], [, b]) => a.accessed - b.accessed
+        );
 
-	/**
-	 * Retrieves a cached value by key with automatic type casting
-	 *
-	 * This method:
-	 * 1. Checks if the key exists in memory cache
-	 * 2. Verifies the entry hasn't expired
-	 * 3. Reads the file from disk
-	 * 4. Deserializes using flatted.parse (handles circular references)
-	 * 5. Returns the value cast to the specified type
-	 *
-	 * @template T - The expected type of the cached value
-	 * @param key - The cache key to retrieve
-	 * @returns The cached value cast to type T, or null if not found/expired/error
-	 *
-	 * @emits error - When file read operations or deserialization fails
-	 *
-	 * @example
-	 * ```typescript
-	 * // Basic usage with type safety
-	 * const username = cache.get<string>('username');
-	 * if (username) {
-	 *   console.log('Welcome back,', username);
-	 * }
-	 *
-	 * // Complex object retrieval
-	 * interface UserProfile {
-	 *   id: number;
-	 *   name: string;
-	 *   preferences: { theme: string; language: string; };
-	 * }
-	 * const profile = cache.get<UserProfile>('user:123');
-	 *
-	 * // Handle circular references (thanks to flatted)
-	 * const circularObj = cache.get<any>('circular-data');
-	 *
-	 * // Array retrieval
-	 * const items = cache.get<string[]>('shopping-list');
-	 * items?.forEach(item => console.log('- ' + item));
-	 *
-	 * // Fallback pattern
-	 * const config = cache.get<Config>('app-config') ?? getDefaultConfig();
-	 * ```
-	 */
-	public get<T>(key: string) {
-		try {
-			// Check if key exists in memory cache
-			if (!this._cache.has(key)) return null;
+        const toRemove = sortedEntries.slice(
+          0,
+          this._cache.size - this._maxSize
+        );
+        for (const [key] of toRemove) {
+          this.delete(key);
+          removed++;
+        }
+      }
 
-			const fileTtl = this._cache.get(key) as number;
-			const fileName = `${key}_${fileTtl}`;
+      if (expired > 0 || removed > 0) {
+        this.emit("cleanup", { expired, removed });
+        this.log(
+          "info",
+          `Cleanup completed: ${expired} expired, ${removed} evicted`
+        );
+      }
+    } catch (error) {
+      this.emitError("cleanup", undefined, error as Error);
+    }
+  }
 
-			// Check if cache entry has expired
-			if (fileTtl !== 0 && fileTtl < Date.now()) {
-				this.checkExpiredFile(fileName);
-				return null;
-			}
+  /**
+   * Starts automatic cleanup timer
+   */
+  private startAutoCleanup(): void {
+    if (this._enableAutoCleanup && this._cleanupInterval > 0) {
+      this._cleanupTimer = setInterval(() => {
+        this.performCleanup();
+      }, this._cleanupInterval);
+    }
+  }
 
-			// Read file contents and deserialize using flatted
-			const filePath = join(this._cacheDir, fileName);
-			const content = readFileSync(filePath, "utf8");
-			const deserialization = this._parse(content);
+  /**
+   * Emits error events with consistent formatting
+   */
+  private emitError(operation: string, key?: string, error?: Error): void {
+    this._stats.errors++;
 
-			return deserialization as T;
-		} catch (error) {
-			this.emit("error", error as Error);
-			return null;
-		}
-	}
+    const cacheError =
+      error instanceof CacheError
+        ? error
+        : new CacheError(
+            error?.message || "Unknown error",
+            operation,
+            key,
+            error
+          );
 
-	/**
-	 * Stores a value in the cache with optional expiration time
-	 *
-	 * This method:
-	 * 1. Calculates the expiration timestamp based on TTL
-	 * 2. Serializes the value using flatted.stringify (supports circular refs)
-	 * 3. Writes the serialized data to a file with TTL in the filename
-	 * 4. Updates the in-memory cache map
-	 * 5. Emits a 'changed' event with the stored value
-	 *
-	 * @param key - The cache key under which to store the value
-	 * @param value - The value to cache (any serializable type, including circular references)
-	 * @param ttl - Time-to-live in milliseconds (0 = never expires, default: 0)
-	 * @returns true if successful, false if failed
-	 *
-	 * @emits changed - When value is successfully stored (includes the stored value)
-	 * @emits error - When file write operations or serialization fails
-	 *
-	 * @example
-	 * ```typescript
-	 * // Store without expiration (permanent)
-	 * cache.set('app-config', { theme: 'dark', version: '2.1.0' });
-	 *
-	 * // Store with specific TTL
-	 * cache.set('user-session', sessionData, 30 * 60 * 1000); // 30 minutes
-	 * cache.set('api-response', apiData, 5 * 60 * 1000);      // 5 minutes
-	 * cache.set('temp-token', token, 60 * 1000);              // 1 minute
-	 *
-	 * // Store complex objects with circular references
-	 * const obj = { name: 'test', parent: null };
-	 * obj.parent = obj; // circular reference
-	 * cache.set('circular-obj', obj); // Works fine with flatted
-	 *
-	 * // Check operation result
-	 * const success = cache.set('important-data', data);
-	 * if (!success) {
-	 *   console.error('Failed to cache important data');
-	 *   // Handle fallback logic
-	 * }
-	 *
-	 * // Listen for changes
-	 * cache.on('changed', (value) => {
-	 *   console.log('Cache updated with:', value);
-	 * });
-	 * ```
-	 */
-	public set(key: string, value: any, ttl = 0) {
-		try {
-			// Calculate expiration timestamp (0 = never expires)
-			const fileTtl = ttl === 0 ? 0 : Date.now() + ttl;
-			const fileName = `${key}_${fileTtl}`;
-			const filePath = join(this._cacheDir, fileName);
+    this.log(
+      "error",
+      `Error in ${operation}${key ? ` for key "${key}"` : ""}`,
+      cacheError
+    );
 
-			// Serialize using flatted to handle circular references
-			const serialization = this._stringify(value);
-			writeFileSync(filePath, serialization);
+    if (this.listenerCount("error") > 0) {
+      this.emit("error", cacheError);
+    }
+  }
 
-			// Update in-memory cache
-			this._cache.set(key, fileTtl);
+  /**
+   * Initializes the cache system
+   */
+  private load(): void {
+    try {
+      const cacheDir = path.resolve(this._cacheDir);
 
-			this.emit("changed", value);
-			return true;
-		} catch (error) {
-			this.emit("error", error as Error);
-			return false;
-		}
-	}
+      if (!existsSync(cacheDir)) {
+        mkdirSync(cacheDir, { recursive: true });
+      }
 
-	/**
-	 * Removes a specific cache entry from both memory and disk
-	 *
-	 * This method:
-	 * 1. Checks if the key exists in memory cache
-	 * 2. Constructs the filename using the key and TTL
-	 * 3. Uses checkExpiredFile to safely remove the file
-	 * 4. Removes the entry from the in-memory cache map
-	 *
-	 * The method is safe to call on non-existent keys and will return true.
-	 *
-	 * @param key - The cache key to delete
-	 * @returns true if successful or key doesn't exist, false if operation failed
-	 *
-	 * @emits error - When file deletion operations fail
-	 *
-	 * @example
-	 * ```typescript
-	 * // Delete specific entries
-	 * cache.delete('expired-session');
-	 * cache.delete('old-api-response');
-	 *
-	 * // Safe to call on non-existent keys
-	 * const result = cache.delete('nonexistent-key'); // returns true
-	 *
-	 * // Delete and verify
-	 * cache.set('temp-data', 'value');
-	 * console.log(cache.has('temp-data')); // true
-	 * cache.delete('temp-data');
-	 * console.log(cache.has('temp-data')); // false
-	 *
-	 * // Conditional deletion
-	 * if (cache.has('user-session')) {
-	 *   cache.delete('user-session');
-	 *   console.log('User session cleared');
-	 * }
-	 *
-	 * // Batch deletion
-	 * const keysToDelete = ['temp1', 'temp2', 'temp3'];
-	 * keysToDelete.forEach(key => cache.delete(key));
-	 * ```
-	 */
-	public delete(key: string) {
-		try {
-			if (!this._cache.has(key)) return true;
+      this.syncMemoryCache();
+      this.startAutoCleanup();
 
-			const fileTtl = this._cache.get(key) as number;
-			const fileName = `${key}_${fileTtl}`;
+      process.nextTick(() => {
+        this.emit("ready", {
+          entriesLoaded: this._cache.size,
+          cacheDir: this._cacheDir,
+        });
+      });
 
-			// Remove file from disk
-			this.checkExpiredFile(fileName);
+      this.log("info", `Cache initialized with ${this._cache.size} entries`);
+    } catch (error) {
+      this.emitError("initialization", undefined, error as Error);
+    }
+  }
 
-			// Remove from memory cache
-			this._cache.delete(key);
+  /**
+   * Synchronizes memory cache with filesystem
+   */
+  private syncMemoryCache(): void {
+    try {
+      const cacheDir = path.resolve(this._cacheDir);
+      if (!existsSync(cacheDir)) return;
 
-			return true;
-		} catch (error) {
-			this.emit("error", error as Error);
-			return false;
-		}
-	}
+      const files = readdirSync(cacheDir);
+      const newCache = new Map<string, CacheEntry>();
+      const now = Date.now();
 
-	/**
-	 * Removes all cache entries from both memory and disk
-	 *
-	 * This method performs a complete cache cleanup:
-	 * 1. Reads all files in the cache directory
-	 * 2. Deletes each file from the filesystem
-	 * 3. Does NOT clear the in-memory cache (potential improvement needed)
-	 *
-	 * This operation is irreversible and will permanently delete all cached data.
-	 *
-	 * @returns null (always returns null regardless of success/failure)
-	 *
-	 * @emits error - When file deletion operations fail
-	 *
-	 * @example
-	 * ```typescript
-	 * // Clear all cache data
-	 * cache.clear();
-	 * console.log('Cache cleared');
-	 *
-	 * // Verify cache is empty (files deleted, but memory cache might still have entries)
-	 * console.log(`Files in cache: ${cache.keys().length}`);
-	 * console.log(`Memory entries: ${cache.size()}`); // May still show entries!
-	 *
-	 * // Listen for errors during clear operation
-	 * cache.on('error', (error) => {
-	 *   console.error('Failed to clear cache:', error.message);
-	 * });
-	 *
-	 * // Clear cache before shutdown
-	 * process.on('SIGTERM', () => {
-	 *   cache.clear();
-	 *   console.log('Cache cleared before shutdown');
-	 * });
-	 * ```
-	 *
-	 * @note This method always returns null. Monitor 'error' events to detect failures.
-	 * @note BUG: This method doesn't clear the in-memory cache - consider adding this._cache.clear()
-	 */
-	public clear() {
-		try {
-			const cacheDir = path.resolve(this._cacheDir);
-			const files = readdirSync(cacheDir);
-			files.forEach((file) => rmSync(join(cacheDir, file)));
+      files.forEach((file) => {
+        try {
+          const parsed = this.parseFileName(file);
+          if (parsed) {
+            const { key, ttl, compressed } = parsed;
 
-			this._cache.clear();
+            // Skip expired entries
+            if (ttl !== 0 && ttl < now) {
+              rmSync(join(cacheDir, file));
+              return;
+            }
 
-			return true;
-		} catch (error) {
-			this.emit("error", error as Error);
-			return false;
-		}
-	}
+            // Get file stats
+            const filePath = join(cacheDir, file);
+            const stats = statSync(filePath);
+
+            newCache.set(key, {
+              ttl,
+              compressed,
+              size: stats.size,
+              created: stats.ctimeMs,
+              accessed: stats.atimeMs,
+            });
+          }
+        } catch (error) {
+          this.log("warn", `Failed to process file ${file}`, error);
+        }
+      });
+
+      this._cache = newCache;
+    } catch (error) {
+      throw new CacheError(
+        "Failed to sync memory cache",
+        "sync",
+        undefined,
+        error as Error
+      );
+    }
+  }
+
+  // =========================
+  // PUBLIC SYNC METHODS
+  // =========================
+
+  /**
+   * Checks if a cache key exists and is not expired
+   */
+  public has(key: string): boolean {
+    if (!this.validateKey(key)) {
+      this.emitError("has", key, new Error("Invalid key format"));
+      return false;
+    }
+
+    if (!this._cache.has(key)) return false;
+
+    const entry = this._cache.get(key)!;
+
+    if (entry.ttl !== 0 && entry.ttl < Date.now()) {
+      this.delete(key);
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Retrieves a cached value by key
+   */
+  public get<T>(key: string): T | null {
+    if (!this.validateKey(key)) {
+      this.emitError("get", key, new Error("Invalid key format"));
+      return null;
+    }
+
+    try {
+      if (!this._cache.has(key)) {
+        this._stats.misses++;
+        return null;
+      }
+
+      const entry = this._cache.get(key)!;
+
+      // Check expiration
+      if (entry.ttl !== 0 && entry.ttl < Date.now()) {
+        this.delete(key);
+        this._stats.misses++;
+        return null;
+      }
+
+      const fileName = this.generateFileName(key, entry.ttl, entry.compressed);
+      const filePath = join(this._cacheDir, fileName);
+
+      if (!existsSync(filePath)) {
+        this._cache.delete(key);
+        this._stats.misses++;
+        return null;
+      }
+
+      const content = readFileSync(filePath, "utf8");
+      const result = this.deserialize<T>(content, entry.compressed);
+
+      // Update access time
+      entry.accessed = Date.now();
+      this._stats.hits++;
+
+      return result;
+    } catch (error) {
+      this.emitError("get", key, error as Error);
+      this._stats.misses++;
+      return null;
+    }
+  }
+
+  /**
+   * Stores a value in the cache
+   */
+  public set(key: string, value: any, ttl?: number): boolean {
+    if (!this.validateKey(key)) {
+      this.emitError("set", key, new Error("Invalid key format"));
+      return false;
+    }
+
+    try {
+      const effectiveTTL = ttl ?? this._defaultTTL;
+      const fileTtl = effectiveTTL === 0 ? 0 : Date.now() + effectiveTTL;
+      const { data, compressed, size } = this.serialize(value);
+
+      const fileName = this.generateFileName(key, fileTtl, compressed);
+      const filePath = join(this._cacheDir, fileName);
+
+      // Remove old entry if it exists
+      if (this._cache.has(key)) {
+        this.delete(key);
+      }
+
+      writeFileSync(filePath, data);
+
+      const now = Date.now();
+      this._cache.set(key, {
+        ttl: fileTtl,
+        compressed,
+        size,
+        created: now,
+        accessed: now,
+      });
+
+      this._stats.sets++;
+      this.emit("change", { operation: "set", key, value });
+
+      // Check size limits after setting
+      if (this._maxSize && this._cache.size > this._maxSize) {
+        this.performCleanup();
+      }
+
+      return true;
+    } catch (error) {
+      console.log("ERROOROROR", error)
+      this.emitError("set", key, error as Error);
+      return false;
+    }
+  }
+
+  /**
+   * Removes a cache entry
+   */
+  public delete(key: string): boolean {
+    if (!this.validateKey(key)) return false;
+
+    try {
+      if (!this._cache.has(key)) return true;
+
+      const entry = this._cache.get(key)!;
+      const fileName = this.generateFileName(key, entry.ttl, entry.compressed);
+      const filePath = join(this._cacheDir, fileName);
+
+      if (existsSync(filePath)) {
+        rmSync(filePath);
+      }
+
+      this._cache.delete(key);
+      this._stats.deletes++;
+      this.emit("change", { operation: "delete", key });
+
+      return true;
+    } catch (error) {
+      this.emitError("delete", key, error as Error);
+      return false;
+    }
+  }
+
+  /**
+   * Clears all cache entries
+   */
+  public clear(): boolean {
+    try {
+      const cacheDir = path.resolve(this._cacheDir);
+      const entriesBefore = this._cache.size;
+
+      if (existsSync(cacheDir)) {
+        const files = readdirSync(cacheDir);
+        files.forEach((file) => rmSync(join(cacheDir, file)));
+      }
+
+      this._cache.clear();
+      this.emit("clear", { entriesRemoved: entriesBefore });
+      this.log("info", `Cache cleared: ${entriesBefore} entries removed`);
+
+      return true;
+    } catch (error) {
+      this.emitError("clear", undefined, error as Error);
+      return false;
+    }
+  }
+
+  /**
+   * Batch set multiple entries
+   */
+  public setMany(entries: Array<{ key: string; value: any; ttl?: number }>): {
+    success: number;
+    failed: number;
+    results: boolean[];
+  } {
+    const results: boolean[] = [];
+    let success = 0;
+    let failed = 0;
+
+    for (const { key, value, ttl } of entries) {
+      const result = this.set(key, value, ttl);
+      results.push(result);
+      if (result) success++;
+      else failed++;
+    }
+
+    this.emit("change", {
+      operation: "setMany",
+      key: `${entries.length} entries`,
+    });
+    return { success, failed, results };
+  }
+
+  /**
+   * Batch get multiple entries
+   */
+  public getMany<T>(
+    keys: string[]
+  ): Array<{ key: string; value: T | null; found: boolean }> {
+    return keys.map((key) => {
+      const value = this.get<T>(key);
+      return { key, value, found: value !== null };
+    });
+  }
+
+  // =========================
+  // PUBLIC ASYNC METHODS
+  // =========================
+
+  /**
+   * Async version of get method
+   */
+  public async getAsync<T>(key: string): Promise<T | null> {
+    if (!this.validateKey(key)) {
+      this.emitError("getAsync", key, new Error("Invalid key format"));
+      return null;
+    }
+
+    try {
+      if (!this._cache.has(key)) {
+        this._stats.misses++;
+        return null;
+      }
+
+      const entry = this._cache.get(key)!;
+
+      if (entry.ttl !== 0 && entry.ttl < Date.now()) {
+        await this.deleteAsync(key);
+        this._stats.misses++;
+        return null;
+      }
+
+      const fileName = this.generateFileName(key, entry.ttl, entry.compressed);
+      const filePath = join(this._cacheDir, fileName);
+
+      try {
+        await stat(filePath);
+      } catch {
+        this._cache.delete(key);
+        this._stats.misses++;
+        return null;
+      }
+
+      const content = await readFile(filePath, "utf8");
+      const result = this.deserialize<T>(content, entry.compressed);
+
+      entry.accessed = Date.now();
+      this._stats.hits++;
+
+      return result;
+    } catch (error) {
+      this.emitError("getAsync", key, error as Error);
+      this._stats.misses++;
+      return null;
+    }
+  }
+
+  /**
+   * Async version of set method
+   */
+  public async setAsync(
+    key: string,
+    value: any,
+    ttl?: number
+  ): Promise<boolean> {
+    if (!this.validateKey(key)) {
+      this.emitError("setAsync", key, new Error("Invalid key format"));
+      return false;
+    }
+
+    try {
+      const effectiveTTL = ttl ?? this._defaultTTL;
+      const fileTtl = effectiveTTL === 0 ? 0 : Date.now() + effectiveTTL;
+      const { data, compressed, size } = this.serialize(value);
+
+      const fileName = this.generateFileName(key, fileTtl, compressed);
+      const filePath = join(this._cacheDir, fileName);
+
+      if (this._cache.has(key)) {
+        await this.deleteAsync(key);
+      }
+
+      await writeFile(filePath, data);
+
+      const now = Date.now();
+      this._cache.set(key, {
+        ttl: fileTtl,
+        compressed,
+        size,
+        created: now,
+        accessed: now,
+      });
+
+      this._stats.sets++;
+      this.emit("change", { operation: "setAsync", key, value });
+
+      if (this._maxSize && this._cache.size > this._maxSize) {
+        this.performCleanup();
+      }
+
+      return true;
+    } catch (error) {
+      this.emitError("setAsync", key, error as Error);
+      return false;
+    }
+  }
+
+  /**
+   * Async version of delete method
+   */
+  public async deleteAsync(key: string): Promise<boolean> {
+    if (!this.validateKey(key)) return false;
+
+    try {
+      if (!this._cache.has(key)) return true;
+
+      const entry = this._cache.get(key)!;
+      const fileName = this.generateFileName(key, entry.ttl, entry.compressed);
+      const filePath = join(this._cacheDir, fileName);
+
+      try {
+        await rm(filePath);
+      } catch {
+        // File might not exist, which is fine
+      }
+
+      this._cache.delete(key);
+      this._stats.deletes++;
+      this.emit("change", { operation: "deleteAsync", key });
+
+      return true;
+    } catch (error) {
+      this.emitError("deleteAsync", key, error as Error);
+      return false;
+    }
+  }
+
+  /**
+   * Async batch operations
+   */
+  public async setManyAsync(
+    entries: Array<{ key: string; value: any; ttl?: number }>
+  ): Promise<{ success: number; failed: number; results: boolean[] }> {
+    const promises = entries.map(({ key, value, ttl }) =>
+      this.setAsync(key, value, ttl)
+    );
+
+    const results = await Promise.all(promises);
+    const success = results.filter((r) => r).length;
+    const failed = results.length - success;
+
+    this.emit("change", {
+      operation: "setManyAsync",
+      key: `${entries.length} entries`,
+    });
+    return { success, failed, results };
+  }
+
+  public async getManyAsync<T>(
+    keys: string[]
+  ): Promise<Array<{ key: string; value: T | null; found: boolean }>> {
+    const promises = keys.map(async (key) => {
+      const value = await this.getAsync<T>(key);
+      return { key, value, found: value !== null };
+    });
+
+    return Promise.all(promises);
+  }
+
+  // =========================
+  // UTILITY & STATS METHODS
+  // =========================
+
+  /**
+   * Returns current cache size
+   */
+  public size(): number {
+    return this._cache.size;
+  }
+
+  /**
+   * Returns all valid cache keys
+   */
+  public keys(): string[] {
+    const now = Date.now();
+    return Array.from(this._cache.entries())
+      .filter(([, entry]) => entry.ttl === 0 || entry.ttl > now)
+      .map(([key]) => key);
+  }
+
+  /**
+   * Returns comprehensive cache statistics
+   */
+  public stats() {
+    const now = Date.now();
+    const validEntries = Array.from(this._cache.entries()).filter(
+      ([, entry]) => entry.ttl === 0 || entry.ttl > now
+    );
+
+    const compressionStats = this.compressionStats();
+    const totalSize = validEntries.reduce(
+      (sum, [, entry]) => sum + entry.size,
+      0
+    );
+
+    return {
+      entries: validEntries.length,
+      memoryEntries: this._cache.size,
+      totalSize,
+      averageSize:
+        validEntries.length > 0
+          ? Math.round(totalSize / validEntries.length)
+          : 0,
+      cacheDir: this._cacheDir,
+      configuration: {
+        maxSize: this._maxSize,
+        maxFileSize: this._maxFileSize,
+        defaultTTL: this._defaultTTL,
+        compressionEnabled: this._enableCompression,
+        compressionThreshold: this._compressionThreshold,
+        compressionLevel: this._compressionLevel,
+      },
+      performance: {
+        hits: this._stats.hits,
+        misses: this._stats.misses,
+        hitRate:
+          this._stats.hits + this._stats.misses > 0
+            ? this._stats.hits / (this._stats.hits + this._stats.misses)
+            : 0,
+        sets: this._stats.sets,
+        deletes: this._stats.deletes,
+        errors: this._stats.errors,
+      },
+      compression: compressionStats,
+    };
+  }
+
+  /**
+   * Returns compression-specific statistics
+   */
+  public compressionStats() {
+    const entries = Array.from(this._cache.values());
+    const compressed = entries.filter((entry) => entry.compressed).length;
+    const total = entries.length;
+
+    return {
+      totalEntries: total,
+      compressedEntries: compressed,
+      uncompressedEntries: total - compressed,
+      compressionRatio: total > 0 ? compressed / total : 0,
+      enabled: this._enableCompression,
+      threshold: this._compressionThreshold,
+      level: this._compressionLevel,
+    };
+  }
+
+  /**
+   * Manually trigger cleanup
+   */
+  public cleanup(): { expired: number; removed: number } {
+    const before = this._cache.size;
+    this.performCleanup();
+    const after = this._cache.size;
+
+    return {
+      expired: 0, // Will be emitted in cleanup event
+      removed: before - after,
+    };
+  }
+
+  /**
+   * Stops auto-cleanup timer and closes cache
+   */
+  public close(): void {
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = undefined;
+    }
+
+    this.removeAllListeners();
+    this.log("info", "Cache closed");
+  }
+
+  /**
+   * Resets all statistics
+   */
+  public resetStats(): void {
+    this._stats = {
+      hits: 0,
+      misses: 0,
+      sets: 0,
+      deletes: 0,
+      errors: 0,
+    };
+  }
 }
-
-export { CacheBox };
